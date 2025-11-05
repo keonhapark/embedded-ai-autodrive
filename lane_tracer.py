@@ -259,14 +259,19 @@ def lane_follow_loop():
             if not ret:
                 print("[ERROR] Failed to read frame")
                 break
-            # 최신 프레임 공유
-            with shared_state.lock:
-                shared_state.latest_frame = frame.copy()
-
 
             frame_count += 1
             frame = cv2.flip(frame, -1)
             height, width = frame.shape[:2]
+
+            # 최신 프레임 공유
+            with shared_state.lock:
+                shared_state.latest_frame = frame.copy()
+                
+            #cv2.imshow("Lane View", frame)
+            #if cv2.waitKey(1) & 0xFF == ord('q'):
+                #break
+
 
             # 좌/우 하단 박스 추출
             left_box  = frame[height-BOX_HEIGHT:height, 0:BOX_WIDTH]
