@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 모델 가중치 — 용량이 커 저장소에 포함하지 않는다 (README 참고)
+models/
+*.pt
+*.h5
+
+# 수집 데이터 및 추론 결과
+object_data/
+data/
+labeled/
+train/
+detect_out*/
+captured_images/
+logs/
+
+.DS_Store
+.vscode/
+.idea/
+
+# 작업 노트 — 로컬 전용
+.scratch
