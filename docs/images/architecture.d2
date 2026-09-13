@@ -1,0 +1,30 @@
+direction: right
+
+camera: Pi Camera
+key: "원격 조작 (SSH)" {style.stroke-dash: 3}
+
+drive: "주행 스레드\n차선 인식 → 판단 → 구동" {
+  style.font-size: 18
+}
+
+state: "shared_state\n(Lock)" {
+  shape: cylinder
+}
+
+detect: "탐지 스레드\nYOLOv8n 탐지 → 7종 분류" {
+  style.font-size: 18
+}
+
+out: 출력 {
+  motor: DC 모터
+  buzzer: 부저
+}
+
+camera -> drive: 프레임
+key -> drive {style.stroke-dash: 3}
+drive -> state: 최신 프레임
+state -> detect: 프레임
+detect -> state: 표지판
+state -> drive: 표지판
+drive -> out.motor
+drive -> out.buzzer
