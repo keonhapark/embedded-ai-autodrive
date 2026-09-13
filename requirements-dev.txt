@@ -1,0 +1,8 @@
+# 개발·테스트용. 라즈베리파이 실행에는 필요하지 않다.
+pytest>=8.0
+
+# 주행 루프를 맥/리눅스에서 그대로 돌려보기 위한 것(tests/test_loop.py).
+# 라즈베리파이 전용인 picamera2·gpiozero 는 여전히 필요 없다.
+# 하드웨어는 FakePin·FakeCamera 로 대체한다.
+numpy
+opencv-python-headless

@@ -1,0 +1,7 @@
+# 줄바꿈을 LF 로 고정한다. 원본은 윈도우에서 편집되어 CRLF 였고,
+# 그 상태에서는 편집 도구에 따라 diff 전체가 바뀐 것처럼 보였다.
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf

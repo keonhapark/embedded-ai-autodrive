@@ -23,3 +23,10 @@ logs/
 
 # 작업 노트 — 로컬 전용
 .scratch
+
+# 개발용 가상환경
+.venv/
+
+# 커버리지 산출물
+.coverage
+htmlcov/

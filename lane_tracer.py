@@ -1,249 +1,132 @@
 """
-Line Tracer Integrated - 통합 라인 트레이서
-교차로 감지 + 객체 인식 + 키보드 제어 통합 시스템
+lane_tracer.py
+--------------
+Act 계층입니다. Sense(vision)와 Plan(control)을 조립해 모터를 호출합니다.
 
-수정 사항 (2024-11-12):
-- main() 함수명을 lane_follow_loop()으로 변경 (main.py와 연동)
-- HSV 색상 범위 확장: [65, 20, 20] ~ [115, 255, 255]
-- 픽셀 임계값 고정값 사용: 1200
-- 라인 트레이싱 로직 단순화
+    vision.measure(frame)  ->  Measurements      무엇을 봤는가
+    control.*              ->  판단              그래서 무엇을 할 것인가
+    hardware.Motor         ->  실행              모터에 전달
 
-수정 사항 (최신):
-- 파란색 픽셀 감지 기능 추가 (종료 조건)
-  * BLUE_PIXEL_THRESHOLD: 파란색 픽셀 임계값 (기본값: 5000px, 사용자 수정 가능)
-  * 감지 영역: 화면 하단 1/4 (75% ~ 100% 영역)
-  * 교차로에서 파란색 종료선 감지 시 프로그램 자동 종료
-  * 파란색 감지 시 픽셀 값을 로그에 실시간 출력
-  
-- 부저를 PWM 방식으로 변경하여 큰 소리 출력
-- 로깅 시스템 추가
-  * 파일 로그: /home/keonha/AI_CAR/logs/ (DEBUG 레벨, 모든 상세 정보)
-  * 콘솔 로그: INFO 레벨 (주요 이벤트만)
-  * 타임스탬프, 로그 레벨, 메시지 포함
+이 파일에는 픽셀 연산(vision.py), 순수 판단(control.py), GPIO 접근(hardware.py)이
+없습니다. 남은 것은 프레임마다 셋을 잇는 순서와, 시간에 의존하는 개루프 동작
+시퀀스입니다.
+
+## 정리하지 않은 것
+
+- handle_runtime_triggers 와 store_direction_signs 가 shared_state 부작용과
+  판단을 섞고 있습니다. 표지판 대응 정책을 control.py 로 옮길 수 있습니다.
+- 표지판 대응(STOP 정지 2초 + 재출발 0.5초)과 정지선 최종 정지(1.5초)는 아직
+  time.sleep 이라 그동안 종료 요청에 바로 반응하지 않습니다. 종료 타임아웃
+  (6초) 안이라 실기 피해는 없습니다.
+- handle_runtime_triggers 의 bare except 두 곳이 KeyboardInterrupt·SystemExit
+  까지 삼킵니다. 원본 그대로입니다.
 """
-import cv2
-import numpy as np
 import time
 import sys
 import select
-from gpiozero import DigitalOutputDevice, PWMOutputDevice
+import threading
 from collections import deque
 
-# shared_state import 시도
+import hardware
+import vision
+
+import config
+import control
+
+# shared_state 는 객체인식 스레드와의 공유 상태입니다. 없으면 인식 없이 주행만 합니다.
+# config·control 을 같은 try 에 넣으면 이 fallback 이 동작하지 않습니다 — 모듈
+# 최상위에서 config 를 읽기 때문에 ImportError 대신 NameError 가 납니다.
 try:
     import shared_state
     OBJECT_DETECTION_ENABLED = True
 except ImportError:
     OBJECT_DETECTION_ENABLED = False
-    pass
 
 # ============================================================
 # 표지판 인식 큐 시스템
 # ============================================================
 recognized_signs = deque(maxlen=5)  # 최근 5개 표지판만 저장
 last_sign_time = 0  # 마지막 표지판 인식 시간
-SIGN_COOLDOWN = 3.0  # 동일 표지판 재인식 방지 시간 (초)
+SIGN_COOLDOWN = config.SIGN_COOLDOWN
 
-# ============================================================
-# 파란색 픽셀 감지 (프로그램 종료 조건)
-# ============================================================
-BLUE_PIXEL_THRESHOLD = 25000  # 파란색 픽셀 임계값 (사용자 수정 가능)
-stopline_stage = 0
-first_stopline_time = 0
-
-# ============================================================
-# (삭제됨) 객체 감지는 바로 실행 - 프레임 체크 없음
-# ============================================================
-
-# ============================================================
-# 모터 / 부저 설정 (Lazy Initialization)
-# ============================================================
-# GPIO 객체들을 None으로 초기화 (실제 초기화는 init_gpio에서)
-PWMA = None
-AIN1 = None
-AIN2 = None
-
-PWMB = None
-BIN1 = None
-BIN2 = None
-
-BUZZER = None
-
-def init_gpio():
-    """GPIO 초기화 - 프로그램 시작 시 한 번 호출"""
-    global PWMA, AIN1, AIN2, PWMB, BIN1, BIN2, BUZZER
-
-    try:
-        # 기존 GPIO 정리 (있다면)
-        if PWMA is not None:
-            PWMA.close()
-        if AIN1 is not None:
-            AIN1.close()
-        if AIN2 is not None:
-            AIN2.close()
-        if PWMB is not None:
-            PWMB.close()
-        if BIN1 is not None:
-            BIN1.close()
-        if BIN2 is not None:
-            BIN2.close()
-        if BUZZER is not None:
-            BUZZER.close()
-    except:
-        pass
-
-    # 새로 초기화
-    PWMA = PWMOutputDevice(18)
-    AIN1 = DigitalOutputDevice(22)
-    AIN2 = DigitalOutputDevice(27)
-
-    PWMB = PWMOutputDevice(23)
-    BIN1 = DigitalOutputDevice(25)
-    BIN2 = DigitalOutputDevice(24)
-
-    # 부저 설정 (PWM으로 큰 소리)
-    try:
-        BUZZER = PWMOutputDevice(12, frequency=2000, initial_value=0)
-    except Exception:
-        BUZZER = None
-        pass
-
-# 속도 프로파일 (최적화 버전 - 안정성과 회전력 균형)
-SPEED_FORWARD_DEFAULT = 0.225  # 기본 직진 속도 (0.40 → 0.45, 약간 증가)
-SPEED_TURN_DEFAULT = 0.30     # 기본 회전 속도 (0.55 → 0.60, 회전력 강화)
-SPEED_SLOW_FORWARD = 0.20     # 감속 직진 (기존 0.25)
-SPEED_SLOW_TURN = 0.16         # 감속 회전 (기존 0.20)
-
-# 현재 속도 (동적 변경용)
-SPEED_FORWARD = SPEED_FORWARD_DEFAULT
-SPEED_TURN = SPEED_TURN_DEFAULT
-
-# ============================================================
-# 모터 제어 함수
-# ============================================================
-def motor_forward():
-    """전진"""
-    AIN1.value = 0
-    AIN2.value = 1
-    PWMA.value = SPEED_FORWARD
-    BIN1.value = 0
-    BIN2.value = 1
-    PWMB.value = SPEED_FORWARD
-
-def motor_left(intensity=1.0):
-    """좌회전 - intensity로 회전 강도 조절 (0.0~1.0)"""
-    # 급격한 회전: 안쪽 바퀴를 후진시킴 (intensity > 0.5일 때)
-    if intensity > 0.5:
-        # 제자리 회전에 가까운 동작
-        AIN1.value = 1  # 왼쪽 후진
-        AIN2.value = 0
-        PWMA.value = SPEED_TURN * 0.3 * intensity
-        BIN1.value = 0  # 오른쪽 전진
-        BIN2.value = 1
-        PWMB.value = SPEED_TURN * 1.2 * intensity
-    else:
-        # 일반 회전: 안쪽 바퀴 느리게
-        left_ratio = 0.0  # 안쪽 바퀴 정지
-        right_ratio = 1.2 * intensity  # 바깥쪽 바퀴 더 빠르게
-        AIN1.value = 0
-        AIN2.value = 1
-        PWMA.value = SPEED_TURN * left_ratio
-        BIN1.value = 0
-        BIN2.value = 1
-        PWMB.value = SPEED_TURN * right_ratio
-
-def motor_right(intensity=1.0):
-    """우회전 - intensity로 회전 강도 조절 (0.0~1.0)"""
-    # 급격한 회전: 안쪽 바퀴를 후진시킴 (intensity > 0.5일 때)
-    if intensity > 0.5:
-        # 제자리 회전에 가까운 동작
-        AIN1.value = 0  # 왼쪽 전진
-        AIN2.value = 1
-        PWMA.value = SPEED_TURN * 1.2 * intensity
-        BIN1.value = 1  # 오른쪽 후진
-        BIN2.value = 0
-        PWMB.value = SPEED_TURN * 0.3 * intensity
-    else:
-        # 일반 회전: 안쪽 바퀴 느리게
-        left_ratio = 1.2 * intensity  # 바깥쪽 바퀴 더 빠르게
-        right_ratio = 0.0  # 안쪽 바퀴 정지
-        AIN1.value = 0
-        AIN2.value = 1
-        PWMA.value = SPEED_TURN * left_ratio
-        BIN1.value = 0
-        BIN2.value = 1
-        PWMB.value = SPEED_TURN * right_ratio
-
-def motor_stop():
-    """정지 - 완전한 브레이크 모드"""
-    AIN1.value = 0
-    AIN2.value = 0  # 왼쪽 모터 브레이크
-    PWMA.value = 0.0
-    BIN1.value = 0
-    BIN2.value = 0  # 오른쪽 모터 브레이크
-    PWMB.value = 0.0
-
-def motor_backward():
-    """후진 - 비정상 픽셀 값 감지 시"""
-    AIN1.value = 1
-    AIN2.value = 0
-    PWMA.value = SPEED_FORWARD * 0.5  # 느리게 후진
-    BIN1.value = 1
-    BIN2.value = 0
-    PWMB.value = SPEED_FORWARD * 0.5
-
-def set_slow_mode():
-    """감속 모드 설정"""
-    global SPEED_FORWARD, SPEED_TURN
-    SPEED_FORWARD = SPEED_SLOW_FORWARD
-    SPEED_TURN = SPEED_SLOW_TURN
-
-def restore_speed():
-    """정상 속도 복원"""
-    global SPEED_FORWARD, SPEED_TURN
-    SPEED_FORWARD = SPEED_FORWARD_DEFAULT
-    SPEED_TURN = SPEED_TURN_DEFAULT
-
-def beep(sec=3.0, volume=1.0):
-    """부저 울리기 - 단순 비프음 (최대 볼륨)"""
-    if BUZZER:
-        BUZZER.value = 1.0  # 최대 볼륨 고정
-        time.sleep(sec)
-        BUZZER.value = 0
-    else:
-        time.sleep(sec)
-
-def play_school_bell():
-    """학교종 - 매우 크고 또렷한 버전! 🔊"""
-    if not BUZZER:
-        time.sleep(1.5)
-        return
-
-    # 음표 길이 대폭 증가 (훨씬 더 길고 크게!)
-    short_beep = 0.45   # 짧은 음 (0.25 → 0.45초, +80%)
-    long_beep = 0.60    # 긴 음 (0.35 → 0.60초, +71%)
-    pause = 0.05        # 음 사이 쉼표 (짧게 → 빠른 템포로 강렬하게)
-
-    # 학교종: 솔 솔 라(길게) 솔 - 4음
-    melody = [
-        (short_beep, pause),  # 솔
-        (short_beep, pause),  # 솔
-        (long_beep, pause),   # 라 (강조)
-        (short_beep, 0)       # 솔
-    ]
-
-    for beep_time, rest_time in melody:
-        BUZZER.value = 1.0  # 최대 볼륨 (100% duty cycle)
-        time.sleep(beep_time)
-        BUZZER.value = 0
-        if rest_time > 0:
-            time.sleep(rest_time)
-
-
+# 모터·부저·카메라는 인자로 받습니다. 받지 못하면 lane_follow_loop 가 직접 만들고
+# 직접 닫습니다.
 
 # ============================================================
 # 유틸리티 함수
 # ============================================================
+def interruptible_sleep(stop_event, seconds):
+    """seconds 동안 기다립니다. 종료 요청이 오면 즉시 True 를 돌려줍니다.
+
+    time.sleep 이면 개루프 시퀀스가 최대 12.8초(신호등 우회전: 정지 3 + 직진 4 +
+    회전 5 + 직진 0.8) 동안 종료 신호에 반응하지 않습니다. main 의 join 은 6초에
+    타임아웃되므로, 그 뒤 스레드가 깨어나 이미 닫힌 핀에 모터 명령을 보낼 수
+    있습니다.
+
+    Event.wait 는 신호가 없으면 타임아웃까지 기다리므로 개루프 타이밍이
+    보존됩니다.
+    """
+    return stop_event.wait(seconds)
+
+
+def drive(motor, action, speed, intensity=1.0):
+    """동작 이름을 모터 호출로 옮깁니다. Plan 과 Act 의 접점입니다.
+
+    speed 는 control.SpeedProfile 입니다. 모터가 속도를 들고 있지 않으므로
+    여기서 넘깁니다.
+    """
+    if action == control.FORWARD:
+        motor.forward(speed.forward)
+    elif action == control.LEFT:
+        motor.left(speed.turn, intensity=intensity)
+    elif action == control.RIGHT:
+        motor.right(speed.turn, intensity=intensity)
+    elif action == control.STOP:
+        motor.stop()
+    else:
+        raise ValueError(f"알 수 없는 동작: {action}")
+
+
+def run_steps(motor, steps, stop_event, speed):
+    """(동작, 초) 열을 순서대로 실행합니다.
+
+    종료 요청이 오면 남은 단계를 버리고 False 를 돌려줍니다.
+
+    speed 는 현재 속도 프로파일이라 개루프 회전도 감속 모드를 따릅니다. 원본도
+    그랬습니다. 표에 속도 칸을 두지 않은 것은 원본에 시퀀스별 속도 구분이 없었기
+    때문입니다. 회전은 원본처럼 항상 최대 강도(1.0)입니다 — 개루프 시퀀스는
+    편차를 보지 않습니다.
+
+    프레임마다 데드라인을 확인하는 상태 기계로 만들지 않은 이유: 그러면 개루프
+    타이밍이 루프 주기로 양자화됩니다. 실제 주기는 camera.read() 와
+    vision.measure() 가 좌우해 지터가 있고, 트랙에서 0.8초 단위로 맞춘 회전
+    시간이 달라질 수 있습니다. 하드웨어 없이는 그 차이를 검증할 수 없어 원본처럼
+    개루프 구간에는 센서를 보지 않습니다.
+    """
+    for action, seconds in steps:
+        # 실행하기 전에 확인합니다. 뒤에서만 확인하면 종료 요청이 이미 서 있어도
+        # 모터가 한 번 움직입니다.
+        if stop_event.is_set():
+            return False
+        drive(motor, action, speed)
+        # 0초 단계(정지 등)는 기다리지 않습니다.
+        if seconds > 0 and interruptible_sleep(stop_event, seconds):
+            return False
+    return True
+
+
+def cleanup(resources):
+    """자원을 하나씩 격리해 정리합니다.
+
+    한 줄로 늘어놓으면 앞의 것이 예외를 던졌을 때 뒤의 것이 모두 건너뛰어집니다.
+    """
+    for resource in resources:
+        closer = getattr(resource, "close", None) or resource.release
+        try:
+            closer()
+        except Exception as e:
+            print(f"[정리 실패] {type(resource).__name__}: {e}")
+
 def get_user_input():
     """사용자 입력 확인 (non-blocking)"""
     if select.select([sys.stdin], [], [], 0)[0]:
@@ -255,16 +138,16 @@ def get_user_input():
     return None
 
 # ============================================================
-# 객체 인식 트리거 처리 (간소화 버전)
+# 객체 인식 트리거 처리
 # ============================================================
-def handle_runtime_triggers():
-    """주행 중 객체 인식 트리거 처리 - 즉시 실행"""
-    global SPEED_FORWARD
+def handle_runtime_triggers(motor, buzzer, speed):
+    """주행 중 객체 인식 트리거를 처리합니다.
 
+    현재 속도 프로파일을 받아 갱신된 프로파일을 돌려줍니다.
+    """
     if not OBJECT_DETECTION_ENABLED:
-        return False
+        return speed
 
-    handled = False
     current_time = time.time()
 
     with shared_state.lock:
@@ -282,36 +165,40 @@ def handle_runtime_triggers():
 
         if can_execute:
             print("[동작] STOP 정지 2초")
-            motor_stop()
-            time.sleep(2.0)
+            motor.stop()
+            time.sleep(config.STOP_SIGN_HOLD_SEC)
 
-            old_speed = SPEED_FORWARD
-            SPEED_FORWARD = SPEED_SLOW_FORWARD
-            motor_forward()
-            time.sleep(0.5)
-            SPEED_FORWARD = old_speed
+            # 재출발만 잠깐 느리게 합니다. 감속 모드(SLOW_SPEED)와 달리 회전
+            # 속도는 건드리지 않습니다. 이 사본은 이 구간에만 쓰고 루프의 speed 는
+            # 그대로입니다.
+            restart = speed.slowed_forward(config.SPEED_SLOW_FORWARD)
+            drive(motor, control.FORWARD, restart)
+            time.sleep(config.STOP_SIGN_RESTART_SLOW_SEC)
 
             with shared_state.lock:
                 shared_state.action_last_time["stop"] = current_time
                 shared_state.object_state["stop"] = False  # 즉시 리셋
 
-        handled = True
 
     # SLOW 표지판
     elif obj_state.get("slow"):
         try:
             with shared_state.lock:
-                if not getattr(shared_state, 'slow_mode_active', False):
+                # 감속 창이 아직 치워지지 않았으면 다시 걸지 않습니다. 창이 만료되는
+                # 프레임에는 아래 파생 블록이 창을 치우기 전이라 여기서 걸리지 않고,
+                # 다음 프레임에야 다시 걸립니다. 그 한 프레임 동안 정상 속도로
+                # 돌아가는 것이 원본 동작입니다. 시각으로 판정(is_slow_mode)하면
+                # 만료 프레임에 곧바로 다시 걸려 표지판이 보이는 동안 감속이 풀리지
+                # 않습니다.
+                if shared_state.slow_mode_until is None:
                     print("[동작] SLOW 감속 3초")
-                    set_slow_mode()
-                    shared_state.slow_mode_until = time.time() + 3.0
-                    shared_state.slow_mode_active = True
+                    shared_state.slow_mode_until = (
+                        current_time + config.SLOW_MODE_DURATION)
                     shared_state.object_state["slow"] = False  # 즉시 리셋
         except:
             pass
-        handled = True
 
-    # HORN 표지판 - 재밌는 멜로디 재생! 🎵
+    # HORN 표지판 - 학교종 멜로디
     elif obj_state.get("horn"):
         can_execute = True
         with shared_state.lock:
@@ -322,75 +209,31 @@ def handle_runtime_triggers():
 
         if can_execute:
             print("[동작] 🎵 학교종 (솔솔라솔)")
-            #honk_strong()
-            play_school_bell()  # 짧은 학교종 멜로디
+            buzzer.play_school_bell()
 
             with shared_state.lock:
                 shared_state.action_last_time["horn"] = current_time
                 shared_state.object_state["horn"] = False  # 즉시 리셋
 
-        handled = True
 
-    # SLOW 모드 자동 해제 체크
+    # 현재 속도는 감속 창에서 파생합니다. 따로 대입하지 않으므로 창과 속도가
+    # 어긋날 수 없습니다.
     try:
         with shared_state.lock:
-            slow_until = getattr(shared_state, 'slow_mode_until', None)
-            if slow_until and time.time() > slow_until:
-                restore_speed()
-                shared_state.slow_mode_until = None
-                shared_state.slow_mode_active = False
+            now = time.time()
+            if not control.is_slow_mode(shared_state.slow_mode_until, now):
+                shared_state.slow_mode_until = None      # 만료된 창을 치웁니다
+            speed = control.profile_for(shared_state.slow_mode_until, now)
     except:
         pass
 
-    return handled
+    return speed
 
 # ============================================================
-# 카메라 초기화
-# ============================================================
-def init_camera():
-    """카메라 초기화 - 640x480 해상도"""
-    max_retries = 3
-    retry_delay = 2
-
-    for attempt in range(max_retries):
-        try:
-            from picamera2 import Picamera2
-
-            if attempt > 0:
-                time.sleep(retry_delay)
-                import subprocess
-                subprocess.run(['pkill', '-f', 'libcamera'], capture_output=True)
-                time.sleep(0.5)
-
-            picam2 = Picamera2()
-            config = picam2.create_preview_configuration(
-                main={"format": "RGB888", "size": (640, 480)}
-            )
-            picam2.configure(config)
-            picam2.start()
-            time.sleep(2)
-
-            class CameraWrapper:
-                def read(self):
-                    frame = picam2.capture_array()
-                    return True, frame
-
-                def release(self):
-                    picam2.stop()
-
-            return CameraWrapper()
-
-        except Exception as e:
-            if "Pipeline handler in use" in str(e) and attempt == max_retries - 1:
-                print(f"[오류] 카메라 사용중")
-
-    return None
-
-# ============================================================
-# 표지판 관리 함수 (간소화)
+# 표지판 관리 함수
 # ============================================================
 def store_direction_signs():
-    """방향 표지판을 인식하여 큐에 저장 - 즉시 저장"""
+    """인식된 방향 표지판을 큐에 저장합니다."""
     if not OBJECT_DETECTION_ENABLED:
         return
 
@@ -412,19 +255,16 @@ def store_direction_signs():
         if obj_state.get(sign):
             conf = confidence.get(sign, 0) if confidence else 0
 
-            # -------------------------
-            # 🔥 방향 표지판 쿨다운 추가
-            # -------------------------
+            # 방향 표지판별 쿨다운
             with shared_state.lock:
                 last_time = shared_state.action_last_time.get(sign, 0)
 
             if current_time - last_time < shared_state.ACTION_COOLDOWN:
                 continue  # 쿨다운 중이면 저장하지 않음
 
-            # 🔥 방향 표지판의 마지막 인식 시간 갱신
+            # 방향 표지판의 마지막 인식 시간 갱신
             with shared_state.lock:
                 shared_state.action_last_time[sign] = current_time
-            # -------------------------
 
             # 신호등은 신뢰도 90% 이상만 저장
             if sign == "traffic" and conf < 0.90:
@@ -437,7 +277,7 @@ def store_direction_signs():
                 'timestamp': timestamp
             }
 
-            # 큐에 저장 (중복 방지)
+            # 큐에 저장 (직전과 같은 표지판이면 저장하지 않음)
             if not recognized_signs or recognized_signs[-1]['type'] != sign:
                 recognized_signs.append(sign_info)
                 last_sign_time = current_time
@@ -450,22 +290,39 @@ def store_direction_signs():
                 }
                 print(f"[저장] {sign_names.get(sign, sign)} (큐:{len(recognized_signs)})")
 
-                # 저장 후 즉시 리셋하여 중복 방지
-                #with shared_state.lock:
-                    #shared_state.object_state[sign] = False
-
                 break
-            
 
             break
 
 # ============================================================
 # 메인 루프
 # ============================================================
-def lane_follow_loop():
-    """통합 라인 트레이서 메인 루프"""
-    # GPIO 초기화
-    init_gpio()
+def lane_follow_loop(motor=None, buzzer=None, camera=None, stop_event=None):
+    """통합 라인 트레이서 메인 루프입니다.
+
+    하드웨어를 인자로 받고, 넘기지 않으면 직접 장치를 엽니다.
+
+    소유권 규칙: **만든 쪽이 닫습니다.** 넘겨받은 장치는 닫지 않습니다. main.py 가
+    소유한 장치를 여기서 닫으면 main 의 종료 처리가 닫힌 핀을 만지게 됩니다.
+    정지(stop)는 소유와 무관하게 항상 합니다. 여러 번 해도 안전합니다.
+
+    stop_event 가 서면 루프를 빠져나옵니다. daemon 스레드는 인터프리터 종료 시
+    finally 를 실행하지 못하고 죽으므로, 이 신호로 빠져나와야 모터 정지가
+    실행됩니다. 개루프 시퀀스(교차로 회전, 차선 이탈 복구)도 stop_event 를 보므로
+    좌회전 9.8초 도중에 종료 요청이 와도 남은 단계를 버리고 빠져나옵니다.
+
+    표지판 대응(최대 2.5초)과 정지선 최종 정지(1.5초)는 아직 time.sleep 이라
+    그동안에는 종료 요청에 바로 반응하지 않습니다.
+    """
+    created = []
+    if motor is None:
+        motor = hardware.Motor(hardware.create_gpio_pins())
+        created.append(motor)
+    if buzzer is None:
+        buzzer = hardware.Buzzer(hardware.create_gpio_buzzer())
+        created.append(buzzer)
+    if stop_event is None:
+        stop_event = threading.Event()
     print(f"[시스템] 객체인식={'ON' if OBJECT_DETECTION_ENABLED else 'OFF'}")
 
     if OBJECT_DETECTION_ENABLED:
@@ -475,66 +332,44 @@ def lane_follow_loop():
         except Exception as e:
             print(f"[오류] shared_state: {e}")
 
-    camera = init_camera()
+    if camera is None:
+        camera = hardware.create_camera()
+        if camera:
+            created.append(camera)
     if not camera:
+        # 카메라 없이는 주행할 수 없습니다. 직접 연 것만 정리하고 빠져나갑니다.
+        # 원본은 핀을 열어 둔 채 반환했습니다.
+        cleanup(created)
         return
-
-    # HSV 범위 - 청록색(Cyan) 라인용 (확장된 범위)
-    lower_cyan = np.array([65, 20, 20])
-    upper_cyan = np.array([115, 255, 255])
-
-    # HSV 범위 - 파란색 감지용 (종료 조건)
-    # 파란색은 HSV에서 100-130도 범위
-    lower_blue = np.array([100, 100, 100])   # 파란색 범위
-    upper_blue = np.array([130, 255, 255])
 
     frame_count = 0
 
-    # 동적 균형 임계값 (속도 기반 - 개선된 버전)
-    BASE_BALANCE_THRESHOLD = 0.35  # 기본 균형 임계값 (저속/중속)
-    HIGH_SPEED_BALANCE_THRESHOLD = 0.25  # 고속 시 균형 임계값 (더 민감)
-
-    # 박스 크기 설정 (해상도에 맞춰)
-    BOX_WIDTH_RATIO = 0.25   # 화면 너비의 25%
-    BOX_HEIGHT_RATIO = 0.25  # 화면 높이의 25%
-
-    # 박스 크기 초기화 (640x480 기준)
-    width = 640
-    height = 480
-    BOX_WIDTH = int(width * BOX_WIDTH_RATIO)
-    BOX_HEIGHT = int(height * BOX_HEIGHT_RATIO)
-
-    # 픽셀 임계값 (고정값)
-    PIXEL_THRESHOLD = 800  # 라인 감지 임계값 (더 민감하게 조정)
-    CENTER_THRESHOLD = 5000  # 교차로 감지 임계값 (고정) (5000->9000)
 
     # 한쪽 라인 없을 때 직진 타이머
     one_side_missing_time = None
     one_side_missing_direction = None
-    STRAIGHT_DURATION = 0.5
 
-    # 교차로 모드 관련 변수
-    intersection_mode = False
-    intersection_exit_time = None
-    intersection_wait_start = None  # 교차로 대기 시작 시간
-    INTERSECTION_EXIT_DURATION = 2.0
-    INTERSECTION_TIMEOUT = 3.0  # 교차로 대기 타임아웃 (3초)
+    # 교차로 상태 (control.IntersectionState — NONE / WAITING / COOLDOWN)
+    inter = control.IntersectionState()
+
+    # 현재 속도 프로파일입니다. 감속 창(shared_state.slow_mode_until)에서 파생하므로
+    # 루프에 다시 들어와도 진행 중인 감속을 이어받습니다.
+    speed = control.profile_for(shared_state.slow_mode_until, time.time())
+
+    # 정지선 2단계 판정 상태입니다. 모듈 전역으로 두면 같은 프로세스의 두 번째
+    # 주행이 stage=1 로 시작해 첫 정지선을 두 번째로 오인하고 바로 끝나므로
+    # 지역 변수로 둡니다.
+    stopline = control.StoplineState()
 
     # 라인 손실 관련
     line_lost_time = None
 
-    # 차량 상태 관련
-    vehicle_stopped = False  # 차량 정지 상태
-    stop_reason = None  # 정지 이유
-
     # 높은 픽셀 값 감지 및 후진 모드
-    HIGH_PIXEL_THRESHOLD = 12000  # 비정상 픽셀 값 임계값
-    HIGH_PIXEL_DURATION = 0.5     # 0.5초 이상 지속 시 후진
     high_pixel_start_time = None  # 높은 픽셀 값 감지 시작 시간
     reverse_mode = False          # 후진 모드 플래그
 
     try:
-        while True:
+        while not stop_event.is_set():
             ret, frame = camera.read()
             if not ret:
                 break
@@ -542,24 +377,10 @@ def lane_follow_loop():
             frame_count += 1
 
             # 이미지 뒤집기
-            frame = cv2.flip(frame, -1)
-
-            # 전체 프레임 크기
-            height, width = frame.shape[:2]
-
-            # ====== 차량 정지 상태 판단 ======
-            # 교차로 모드일 때만 vehicle_stopped 사용
-            if intersection_mode:
-                if not vehicle_stopped:
-                    vehicle_stopped = True
-                    stop_reason = "교차로 대기"
-            else:
-                if vehicle_stopped and stop_reason == "교차로 대기":
-                    vehicle_stopped = False
-                    stop_reason = None
+            frame = vision.upright(frame)
 
             # shared_state에 프레임 전달
-            if OBJECT_DETECTION_ENABLED and frame_count % 2 == 0:
+            if OBJECT_DETECTION_ENABLED and frame_count % config.FRAME_SHARE_INTERVAL == 0:
                 try:
                     with shared_state.lock:
                         shared_state.latest_frame = frame.copy()
@@ -567,396 +388,171 @@ def lane_follow_loop():
                     pass
 
             # ====== 방향 표지판을 큐에 저장 ======
-            if OBJECT_DETECTION_ENABLED and frame_count % 2 == 0:
+            if OBJECT_DETECTION_ENABLED and frame_count % config.FRAME_SHARE_INTERVAL == 0:
                 store_direction_signs()
 
-            # ====== 교차로에서만 특별 처리 ======
-            if vehicle_stopped and stop_reason == "교차로 대기":
-                # 교차로에서는 라인 인식 건너뛰기
-                left_pixels = 0
-                right_pixels = 0
-                center_pixels = 0
-                total_pixels = 0
-                left_ratio = 0.0
-                right_ratio = 0.0
-                diff = 0.0
-                blue_pixels = 0  # 파란색 픽셀도 초기화
-
-                # 박스 크기 계산
-                BOX_WIDTH = int(width * BOX_WIDTH_RATIO)
-                BOX_HEIGHT = int(height * BOX_HEIGHT_RATIO)
-
+            # ====== Sense — 프레임에서 픽셀 수를 읽습니다 (vision.measure) ======
+            if inter.waiting:
+                # 교차로 대기 중에는 차선을 보지 않습니다. 원본도 이때 모든
+                # 측정값을 0 으로 두었고, Measurements() 의 기본값이 같습니다.
+                measured = vision.Measurements()
             else:
-                # ====== 정상 주행 - 라인 인식 수행 ======
-                # 동적 박스 크기 계산
-                BOX_WIDTH = int(width * BOX_WIDTH_RATIO)
-                BOX_HEIGHT = int(height * BOX_HEIGHT_RATIO)
+                measured = vision.measure(frame)
 
-                # PIXEL_THRESHOLD는 이미 고정값으로 설정됨 (1200)
+                if (frame_count % config.BLUE_LOG_INTERVAL_FRAMES == 0
+                        and measured.blue_pixels > config.BLUE_LOG_MIN_PIXELS):
+                    print(f"[파란색 감지] {measured.blue_pixels}px "
+                          f"(임계값: {config.BLUE_PIXEL_THRESHOLD}px)")
 
-                # 좌하단 박스
-                left_box_x1 = 0
-                left_box_y1 = height - BOX_HEIGHT
-                left_box_x2 = BOX_WIDTH
-                left_box_y2 = height
 
-                # 우하단 박스
-                right_box_x1 = width - BOX_WIDTH
-                right_box_y1 = height - BOX_HEIGHT
-                right_box_x2 = width
-                right_box_y2 = height
-
-                # 전방 중앙 박스 (교차로 감지용)
-                center_box_width = int(width * 0.6)  # 화면 너비의 60%
-                center_box_height = int(height * 0.15)  # 화면 높이의 15%
-                center_box_x1 = (width - center_box_width) // 2
-                center_box_y1 = int(height * 0.3)  # 화면 상단 30% 위치
-                center_box_x2 = center_box_x1 + center_box_width
-                center_box_y2 = center_box_y1 + center_box_height
-
-                # ====== HSV 변환 최적화: 전체 프레임 1회 변환 ======
-                hsv_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-
-                # 좌측 박스 처리 (HSV 프레임에서 슬라이싱)
-                hsv_left = hsv_frame[left_box_y1:left_box_y2, left_box_x1:left_box_x2]
-                mask_left = cv2.inRange(hsv_left, lower_cyan, upper_cyan)
-
-                # 노이즈 제거
-                kernel = np.ones((3, 3), np.uint8)
-                mask_left = cv2.erode(mask_left, kernel, iterations=2)
-                mask_left = cv2.dilate(mask_left, kernel, iterations=3)
-
-                # 우측 박스 처리 (HSV 프레임에서 슬라이싱)
-                hsv_right = hsv_frame[right_box_y1:right_box_y2, right_box_x1:right_box_x2]
-                mask_right = cv2.inRange(hsv_right, lower_cyan, upper_cyan)
-                mask_right = cv2.erode(mask_right, kernel, iterations=2)
-                mask_right = cv2.dilate(mask_right, kernel, iterations=3)
-
-                # 전방 중앙 박스 처리 (HSV 프레임에서 슬라이싱)
-                hsv_center = hsv_frame[center_box_y1:center_box_y2, center_box_x1:center_box_x2]
-                mask_center = cv2.inRange(hsv_center, lower_cyan, upper_cyan)
-                mask_center = cv2.erode(mask_center, kernel, iterations=2)
-                mask_center = cv2.dilate(mask_center, kernel, iterations=3)
-
-                # 파란색 픽셀 감지 (화면 하단 1/4 영역)
-                blue_box_x1 = 0
-                blue_box_y1 = int(height * 0.75)  # 75% 위치부터
-                blue_box_x2 = width
-                blue_box_y2 = height
-
-                hsv_blue_area = hsv_frame[blue_box_y1:blue_box_y2, blue_box_x1:blue_box_x2]
-                mask_blue = cv2.inRange(hsv_blue_area, lower_blue, upper_blue)
-                mask_blue = cv2.erode(mask_blue, kernel, iterations=2)
-                mask_blue = cv2.dilate(mask_blue, kernel, iterations=3)
-                blue_pixels = cv2.countNonZero(mask_blue)
-
-                # 파란색 픽셀 로그 출력 (10프레임마다, 500px 이상일 때만)
-                if frame_count % 10 == 0 and blue_pixels > 500:
-                    print(f"[파란색 감지] {blue_pixels}px (임계값: {BLUE_PIXEL_THRESHOLD}px)")
-
-                # 픽셀 수 계산
-                left_pixels = cv2.countNonZero(mask_left)
-                right_pixels = cv2.countNonZero(mask_right)
-                center_pixels = cv2.countNonZero(mask_center)
-                total_pixels = left_pixels + right_pixels
-
-                # CENTER_THRESHOLD는 이미 고정값으로 설정됨 (5000)
-
-                # 좌우 비율 계산
-                if total_pixels > 0:
-                    left_ratio = left_pixels / total_pixels
-                    right_ratio = right_pixels / total_pixels
-                else:
-                    left_ratio = 0.0
-                    right_ratio = 0.0
-
-                # 좌우 차이
-                diff = abs(left_ratio - right_ratio)
-
-            # 균형 임계값은 고정값 사용 (BALANCE_THRESHOLD)
-
-            # ====== 높은 픽셀 값 감지 및 후진 처리 ======
-            if left_pixels > HIGH_PIXEL_THRESHOLD or right_pixels > HIGH_PIXEL_THRESHOLD:
-                # 높은 픽셀 값 감지
-                if high_pixel_start_time is None:
-                    high_pixel_start_time = time.time()
-                elif time.time() - high_pixel_start_time >= HIGH_PIXEL_DURATION:
-                    # 0.5초 이상 지속됨 → 후진 모드 활성화
-                    if not reverse_mode:
-                        reverse_mode = True
-            else:
-                # 정상 픽셀 값으로 복귀
-                if reverse_mode:
-                    reverse_mode = False
-                    high_pixel_start_time = None
-                elif high_pixel_start_time is not None:
-                    # 타이머만 리셋 (0.5초 전에 정상 복귀)
-                    high_pixel_start_time = None
+            # ====== 높은 픽셀 값 감지 및 후진 처리 (control.check_reverse) ======
+            reverse_state = control.check_reverse(
+                measured.left_pixels, measured.right_pixels,
+                control.ReverseState(reverse_mode, high_pixel_start_time),
+                time.time())
+            reverse_mode = reverse_state.reverse_mode
+            high_pixel_start_time = reverse_state.high_since
 
             # ====== 후진 모드 실행 ======
             if reverse_mode:
-                motor_backward()
-                time.sleep(0.1)
+                motor.backward(speed.forward)
+                time.sleep(config.REVERSE_LOOP_DELAY_SEC)
                 continue
 
 
             # ====== 교차로 모드에서 키보드 입력 처리 ======
-            if intersection_mode:
-                # 먼저 저장된 표지판 확인하여 자동 키 입력으로 변환
-                auto_input = False
-                user_input = None
-                if OBJECT_DETECTION_ENABLED and recognized_signs and user_input is None:
+            if inter.waiting:
+                # 표지판 큐에서 꺼내는 것은 부작용이라 여기서 합니다.
+                # control.plan_intersection 은 꺼낸 문자열만 받습니다.
+                sign_type = None
+                if OBJECT_DETECTION_ENABLED and recognized_signs:
+                    sign_type = recognized_signs.popleft()['type']
 
-                    # sign_info = recognized_signs[-1]  # 가장 먼저 저장된 표지판 확인
-                    # sign_type = sign_info['type']
+                # get_user_input() 은 stdin 에서 한 글자를 소비합니다. 표지판이
+                # 있거나 타임아웃이 성립한 프레임에서는 읽지 않습니다. 읽어도
+                # 우선순위에서 밀려 버려지므로 조작자가 누른 키가 사라집니다.
+                # 원본도 두 경우에 stdin 을 읽지 않았습니다.
+                now = time.time()
+                key = None
+                if sign_type is None and not control.intersection_timed_out(inter, now):
+                    key = get_user_input()
 
-                    sign_info = recognized_signs.popleft()   # 가장 먼저 들어온 명령
-                    sign_type = sign_info['type']
+                maneuver, source = control.plan_intersection(
+                    inter, sign_type, key, now)
 
+                if maneuver is None:
+                    motor.stop()          # 지시를 기다리는 중
+                    continue
 
-                    # 표지판을 키 입력으로 변환
-                    sign_to_key = {
-                        'go_straight': 'w',
-                        'turn_left': 'a',
-                        'turn_right': 'd',
-                        'traffic': 'traffic'  # 신호등은 특별 처리
-                    }
+                # 키보드 입력에는 로그를 찍지 않습니다(원본과 같음). 원본의 신호등
+                # 로그 두 줄("3초 대기 중", "우회전 시작")은 시퀀스를 표로 바꾸면서
+                # 없어졌습니다.
+                if source is control.FROM_TIMEOUT:
+                    print("[타임아웃] 자동 직진")
+                elif source is control.FROM_SIGN:
+                    print(f"[실행] {control.MANEUVER_NAMES[maneuver]}")
 
-                    if sign_type in sign_to_key:
-                        user_input = sign_to_key[sign_type]
-                        auto_input = True
+                # 완주하지 못했으면 쿨다운 갱신과 상태 전이를 하지 않습니다.
+                # 수행하지 않은 지시를 수행 완료로 기록하면 안 됩니다.
+                if not run_steps(motor, control.steps_for(maneuver, source),
+                                 stop_event, speed):
+                    break
 
-                        sign_names = {
-                            'go_straight': '직진',
-                            'turn_left': '좌회전',
-                            'turn_right': '우회전',
-                            'traffic': '신호등 (3초 대기)'
-                        }
-                        print(f"[실행] {sign_names.get(sign_type, sign_type)}")
+                if source is control.FROM_SIGN:
+                    with shared_state.lock:
+                        shared_state.action_last_time[sign_type] = time.time()
+                    recognized_signs.clear()
 
-                # 타임아웃 체크
-                if not user_input and intersection_wait_start:
-                    wait_time = time.time() - intersection_wait_start
-
-                    if wait_time >= INTERSECTION_TIMEOUT:
-                        print("[타임아웃] 자동 직진")
-                        motor_forward()
-                        time.sleep(0.5) #추가
-                        intersection_mode = False
-                        intersection_exit_time = time.time()
-                        intersection_wait_start = None
-                        vehicle_stopped = False
-                        continue
-
-                if not user_input:
-                    user_input = get_user_input()
-                if user_input:
-
-                    if user_input == 'w':
-                        motor_forward()
-                        time.sleep(6)
-
-                    elif user_input == 'a':
-                        motor_forward()
-                        time.sleep(4)  # 진입 시간
-                        motor_left(1.0)
-                        time.sleep(5)  # 회전 시간
-                        motor_forward()
-                        time.sleep(0.8)  # 탈출 시간
-
-                    elif user_input == 'd':
-                        motor_forward()
-                        time.sleep(1)  # 진입 시간
-                        motor_right(1.0)
-                        time.sleep(5)  # 회전 시간
-                        motor_forward()
-                        time.sleep(0.8)  # 탈출 시간
-                    elif user_input == 'traffic':
-                        # 신호등: 3초 대기 후 'd' (우회전) 실행
-                        print("🚦 [신호등] 3초 대기 중...")
-                        motor_stop()
-                        time.sleep(3.0)  # 3초 정지
-                        print("🚦 [신호등] 우회전 시작!")
-                        # 'd' 케이스와 동일한 우회전 실행
-                        motor_forward()
-                        time.sleep(4)  # 진입 시간
-                        motor_right(1.0)
-                        time.sleep(5)  # 회전 시간
-                        motor_forward()
-                        time.sleep(0.8)  # 탈출 시간
-                    elif user_input == 's':
-                        motor_stop()
-
-                    # ===================================
-                    # 🔥 실행된 표지판 쿨다운 시간 갱신 (여기에 넣음)
-                    # ===================================
-                    if auto_input and sign_type:
-                        with shared_state.lock:
-                            shared_state.action_last_time[sign_type] = time.time()
-
-                    # 자동 명령이면 큐 비우기
-                    if auto_input:
-                        recognized_signs.clear()
-                    
-                    intersection_mode = False
-                    intersection_exit_time = time.time()
-                    intersection_wait_start = None
-                    vehicle_stopped = False
-                else:
-                    # 키보드 입력 대기 중
-                    motor_stop()
+                inter = control.exit_intersection(time.time())
                 continue
 
-            # ====== 교차로 탈출 중이면 일정 시간 교차로 감지 무시 ======
-            if intersection_exit_time:
-                elapsed = time.time() - intersection_exit_time
-                if elapsed >= INTERSECTION_EXIT_DURATION:
-                    intersection_exit_time = None
+            # ====== 교차로 통과 직후면 일정 시간 재감지를 억제합니다 ======
+            inter = control.tick_intersection(inter, time.time())
 
 
+            # ====== 이 프레임에서 어느 갈래로 갈지 (control.select_branch) ======
+            # 원본은 여기부터 if/elif 체인이었습니다. 갈래 선택을 순수 함수로 분리해
+            # 각 갈래에 도달하는지를 테스트로 확인합니다.
+            branch = control.select_branch(measured, inter)
 
-            # ====== 파란색 픽셀 감지 (항상 체크 - 교차로와 무관) ======
-            if not intersection_exit_time and blue_pixels >= BLUE_PIXEL_THRESHOLD:
-                global stopline_stage, first_stopline_time
-                # 1단계: 첫 번째 정지선 감지 → 통과
-                if stopline_stage == 0:
-                    print(f"[정지선] 첫 번째 정지선 감지 ({blue_pixels}px) → 계속 진행")
-                    stopline_stage = 1
-                    first_stopline_time = time.time()
-                    # 멈추지 않고 그냥 직진하도록 처리
-                    # 필요하면 살짝 감속 가능: SPEED_FORWARD = SPEED_SLOW_FORWARD
+            if branch is control.Branch.STOPLINE:
+                decision = control.check_stopline(
+                    measured.blue_pixels, stopline, time.time())
+                stopline = decision.state
 
-                # 2단계: 두 번째 정지선 감지 → 정지 및 종료
-                elif stopline_stage == 1:
-                # 첫 정지선과 너무 가까우면 노이즈 → 무시
-                    if time.time() - first_stopline_time < 0.3:
-                        pass
-                    else:
-                        print(f"\n[정지선] 두 번째 정지선 감지: {blue_pixels}px")
-                        print("[종료] 정지선 사이 → 최종 정지 및 종료")
-                        motor_stop()
-                        time.sleep(1.5)
-                        break
+                if decision.passed_first:
+                    print(f"[정지선] 첫 번째 정지선 감지 ({measured.blue_pixels}px) → 계속 진행")
+                if decision.should_stop:
+                    print(f"\n[정지선] 두 번째 정지선 감지: {measured.blue_pixels}px")
+                    print("[종료] 정지선 사이 → 최종 정지 및 종료")
+                    motor.stop()
+                    time.sleep(config.STOPLINE_FINAL_STOP_SEC)
+                    break
 
             # ====== 교차로 감지 ======
-            elif not intersection_exit_time and center_pixels > CENTER_THRESHOLD and total_pixels < PIXEL_THRESHOLD * 2:
-                if not intersection_mode:
-                    motor_stop()
-                    intersection_mode = True
-                    intersection_wait_start = time.time()
+            elif branch is control.Branch.INTERSECTION:
+                # 원본에는 여기 `if not intersection_mode:` 재진입 가드가 있었습니다.
+                # inter.detecting 이 이미 NONE 을 보장하므로(WAITING 이면 위에서
+                # continue 합니다) 항상 참이라 뺐습니다.
+                motor.stop()
+                inter = control.enter_intersection(time.time())
 
-                    queue_info = f" 큐:{len(recognized_signs)}" if recognized_signs else ""
-                    print(f"[교차로]{queue_info}")
+                queue_info = f" 큐:{len(recognized_signs)}" if recognized_signs else ""
+                print(f"[교차로]{queue_info}")
 
             # ====== 라인 이탈 ======
-            elif total_pixels < PIXEL_THRESHOLD:
+            elif branch is control.Branch.LINE_LOST:
                 if line_lost_time is None:
                     line_lost_time = time.time()
-                    motor_stop()
+                    motor.stop()
 
-                # 키보드 입력 확인
-                user_input = get_user_input()
-                if user_input:
-                    if user_input == 'w':
-                        motor_forward()
-                        time.sleep(6)
-                    elif user_input == 'a':
-                        motor_forward()
-                        time.sleep(5)  # 진입 시간 (교차로와 동일)
-                        motor_left(1.0)
-                        time.sleep(5)  # 회전 시간 (교차로와 동일)
-                        motor_forward()
-                        time.sleep(0.8)  # 탈출 시간 (교차로와 동일)
-                    elif user_input == 'd':
-                        motor_forward()
-                        time.sleep(4)  # 진입 시간 (교차로와 동일)
-                        motor_right(1.0)
-                        time.sleep(5)  # 회전 시간 (교차로와 동일)
-                        motor_forward()
-                        time.sleep(0.8)  # 탈출 시간 (교차로와 동일)
-                    elif user_input == 's':
-                        motor_stop()
+                # 수동 복구입니다. 교차로와 같은 지시를 쓰지만 시간 표가 다릅니다
+                # (control.LINELOST_STEPS 참고). 매핑에 없는 문자는 무시합니다.
+                # 원본도 여기서는 탈출 처리가 없어 아무 일도 일어나지 않았습니다.
+                maneuver = control.KEY_TO_MANEUVER.get(get_user_input())
+                if maneuver is not None:
+                    if not run_steps(motor, control.LINELOST_STEPS[maneuver],
+                                     stop_event, speed):
+                        break
 
             # ====== 라인 트레이싱 ======
-            elif total_pixels >= PIXEL_THRESHOLD:
+            else:
                 if line_lost_time is not None:
                     line_lost_time = None
 
-                vehicle_stopped = False
+                # 조향 결정 (control.decide_steering — 순수 함수)
+                steering = control.decide_steering(
+                    measured.left_pixels, measured.right_pixels, speed.forward,
+                    control.OneSideState(one_side_missing_time,
+                                         one_side_missing_direction),
+                    time.time())
+                one_side_missing_time = steering.one_side.missing_since
+                one_side_missing_direction = steering.one_side.direction
 
-                # 동적 임계값 계산 (속도 기반)
-                is_high_speed = SPEED_FORWARD > 0.6
-                current_balance_threshold = HIGH_SPEED_BALANCE_THRESHOLD if is_high_speed else BASE_BALANCE_THRESHOLD
-
-                if diff < current_balance_threshold:
-                    # 좌우 균형 잡힘 → 전진
-                    motor_forward()
-                    one_side_missing_time = None
-                    one_side_missing_direction = None
-
-                elif left_pixels > right_pixels:
-                    # 왼쪽에 청록색이 많음 → 우회전 필요
-                    # 편차에 비례한 회전 강도 계산 (최대 편차 50%로 정규화)
-                    turn_intensity = min(1.0, diff / 0.5)
-
-                    if right_pixels < 50:
-                        # 오른쪽 라인이 거의 없음
-                        if one_side_missing_time is None or one_side_missing_direction != 'RIGHT':
-                            one_side_missing_time = time.time()
-                            one_side_missing_direction = 'RIGHT'
-
-                        elapsed = time.time() - one_side_missing_time
-                        if elapsed < STRAIGHT_DURATION:
-                            # 직진 유지 (0.5초)
-                            motor_forward()
-                        else:
-                            # 강한 우회전 (intensity * 1.25로 완화 - 과도한 회전 방지)
-                            motor_right(min(1.0, turn_intensity * 1.25))
-                    else:
-                        # 일반 우회전 (비례 제어)
-                        motor_right(turn_intensity)
-                        one_side_missing_time = None
-                        one_side_missing_direction = None
-
-                else:
-                    # 오른쪽에 청록색이 많음 → 좌회전 필요
-                    # 편차에 비례한 회전 강도 계산 (최대 편차 50%로 정규화)
-                    turn_intensity = min(1.0, diff / 0.5)
-
-                    if left_pixels < 50:
-                        # 왼쪽 라인이 거의 없음
-                        if one_side_missing_time is None or one_side_missing_direction != 'LEFT':
-                            one_side_missing_time = time.time()
-                            one_side_missing_direction = 'LEFT'
-
-                        elapsed = time.time() - one_side_missing_time
-                        if elapsed < STRAIGHT_DURATION:
-                            # 직진 유지 (0.5초)
-                            motor_forward()
-                        else:
-                            # 강한 좌회전 (intensity * 1.25로 완화 - 과도한 회전 방지)
-                            motor_left(min(1.0, turn_intensity * 1.25))
-                    else:
-                        # 일반 좌회전 (비례 제어)
-                        motor_left(turn_intensity)
-                        one_side_missing_time = None
-                        one_side_missing_direction = None
+                # drive() 를 거쳐 동작 디스패치를 한 곳으로 모읍니다.
+                drive(motor, steering.action, speed, steering.intensity)
 
                 # 주행 중 객체 인식 트리거 처리
-                handle_runtime_triggers()
+                speed = handle_runtime_triggers(motor, buzzer, speed)
 
-            time.sleep(0.02)
+            # time.sleep 대신 wait 를 써서 종료 신호에 바로 반응합니다.
+            # 루프는 시간 대부분을 여기서 보냅니다.
+            stop_event.wait(config.LANE_LOOP_DELAY_SEC)
 
     except KeyboardInterrupt:
+        # 이 함수를 단독 실행(python3 lane_tracer.py)할 때만 옵니다.
+        # main.py 경로에서는 SIGINT 가 메인 스레드로만 갑니다.
         print("\n[종료]")
 
     finally:
-        motor_stop()
-        if PWMA:
-            PWMA.value = 0.0
-        if PWMB:
-            PWMB.value = 0.0
-        camera.release()
+        # stop_event 로 빠져나오므로 종료 시 이 블록이 실제로 실행됩니다.
+        # 개루프 시퀀스 중에 종료해도 run_steps 가 중단하고 여기로 옵니다.
+        # 정지는 소유와 무관하게 항상, 닫기는 직접 만든 것만 합니다.
+        try:
+            motor.stop()
+        except Exception as e:
+            print(f"[정리 실패] motor.stop: {e}")
+        cleanup(created)
 
 if __name__ == '__main__':
     lane_follow_loop()

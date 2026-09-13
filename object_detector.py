@@ -6,10 +6,12 @@
 # ============================================================
 
 import time
+import threading
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import shared_state
+import config
 import os
 from datetime import datetime
 from PIL import Image
@@ -21,24 +23,32 @@ from PIL import Image
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(BASE_DIR)
 
-DETECTOR_PATH = os.path.join(PARENT_DIR, "models", "sign_traffic_detectorV3.pt")   # sign / traffic
-CLASSIFIER_PATH = os.path.join(PARENT_DIR, "models", "sign_traffic_classifierV3.pt")   # 8-class classifier
+DETECTOR_PATH = os.path.join(PARENT_DIR, config.DETECTOR_MODEL)
+CLASSIFIER_PATH = os.path.join(PARENT_DIR, config.CLASSIFIER_MODEL)
 
-MIN_AREA = 10000
-NEAR_AREA = 20000
-CONF_THRESHOLD = 0.8
-CLASSIFIER_CONF_THRESHOLD = 0.90
+MIN_AREA = config.MIN_AREA
+NEAR_AREA = config.NEAR_AREA
+CONF_THRESHOLD = config.CONF_THRESHOLD
+CLASSIFIER_CONF_THRESHOLD = config.CLASSIFIER_CONF_THRESHOLD
 
 
-CAPTURE_FOLDER = "/home/keonha/AI_CAR/captured_images"
-MAX_CAPTURES_PER_OBJECT = 1
+CAPTURE_FOLDER = config.CAPTURE_FOLDER
+MAX_CAPTURES_PER_OBJECT = config.MAX_CAPTURES_PER_OBJECT
 
 
 
 # ============================================================
 # 메인 루프
 # ============================================================
-def object_detect_loop():
+def object_detect_loop(stop_event=None):
+    """객체 탐지 스레드.
+
+    stop_event 가 서면 루프를 빠져나옵니다. 없으면 자체 Event 를 만들어
+    단독 실행(무한 루프)합니다.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
 
     print("=" * 70)
     print(" YOLOv8 Object Detector (Detector → Classifier 구조)")
@@ -73,18 +83,19 @@ def object_detect_loop():
     # 실행 루프
     # ---------------------------
     try:
-        while True:
+        while not stop_event.is_set():
 
             # 최신 프레임 가져오기
             with shared_state.lock:
                 frame_rgb = getattr(shared_state, "latest_frame", None)
 
             if frame_rgb is None:
-                time.sleep(0.05)
+                time.sleep(config.DETECTION_NO_FRAME_DELAY_SEC)
                 continue
 
             _, width = frame_rgb.shape[:2]
-            roi_rgb = frame_rgb[:, width // 2:]   # right half ROI
+            # 검출 ROI: 프레임 오른쪽 절반만 추론합니다(config 참조).
+            roi_rgb = frame_rgb[:, int(width * config.DETECTION_ROI_LEFT_RATIO):]
 
 
             # ------------------------------------------------
@@ -94,7 +105,7 @@ def object_detect_loop():
             if not results or results[0].boxes is None:
                 with shared_state.lock:
                     shared_state.object_detected = None
-                time.sleep(0.1)
+                time.sleep(config.DETECTION_EMPTY_RESULT_DELAY_SEC)
                 continue
 
 
@@ -127,7 +138,7 @@ def object_detect_loop():
                 # 분류 모델 실행
                 # -------------------------------
                 if classifier:
-                    cls_res = classifier.predict(crop, imgsz=224, verbose=False)
+                    cls_res = classifier.predict(crop, imgsz=config.CLASSIFIER_IMGSZ, verbose=False)
                     if cls_res:
                         cls_id = int(cls_res[0].probs.top1)
                         cls_name = cls_res[0].names[cls_id]
@@ -185,7 +196,7 @@ def object_detect_loop():
                 else:
                     shared_state.object_detected = None
 
-            time.sleep(0.10)
+            stop_event.wait(config.DETECTION_LOOP_DELAY_SEC)
 
     except KeyboardInterrupt:
         print("🛑 Object detector stopped")
